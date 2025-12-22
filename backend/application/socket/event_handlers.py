@@ -5,6 +5,13 @@ from application.services.service_chat import criar_chat
 from application.services.service_mensagem import criar_mensagem, buscar_ultimas_n_mensagens
 from application.libs.mistral_handler import contar_tokens_mensagens, formatar_mensagens_para_texto, formatar_mensagem_salva, formatar_mensagens_recentes, formatar_mensagens_tokenizacao
 from application.constants import LLM_UUID
+
+from Impl.Prompt import CriarPrompt
+from Impl.CriarNomeChat import GerarNomeDoChat
+from Impl.ResumoChat import CriarResumoDasMensagensDoChat
+from Impl.BuscaMaterialSem import RealizarBuscaNoMaterialSemanticoDaMateria
+from Impl.Embedding import GerarEmbeddingDeMaterial, GerarEmbeddingDeMensagem
+
 import uuid
 import ollama
 
@@ -13,359 +20,162 @@ socketio = SocketIO(cors_allowed_origins="*", async_mode="eventlet")
 client = ollama.Client(host='http://localhost:11434')
 
 pendentes = {}
+materiais = {}
+resumo_local = {}
 
 @socketio.on("connect")
 def handle_connect():
     emit("connection-confirmation", {"data": "Conexão estabelecida"})
 
-@socketio.on('mensagem_inicial')
-def handle_mensagem_inicial(data: dict[str, str]):
+
+@socketio.on('abrindo_novo_chat')
+def handle_abrir_novo_chat(data: dict[str,str]):
     """
-    Função responsável por lidar com mensagens iniciais.
+    Função responsável por lidar com a criação de um novo chat
 
     Espera receber:
-        - `aluno_id`: o ID do aluno que enviou a mensagem
-        - `mensagem`: o conteúdo da mensagem
+        - `aluno_id`: o ID do usuário que enviou a mensagem
+        - `materia_id`: o ID da matéria selecionada para o chat
+        - `mensagem`: o conteúdo da mensagem 
 
-        1. Cria um novo chat usando o ID do aluno
-        2. Salva a mensagem no banco de dados relacional usando o ID do aluno e o ID do chat criado
-        3. Armazena ambos no dicionário `pendentes` para emitir em outros eventos após receber o "handshake" do front-end
+        1 - criar nome do novo chat
+        2 - criar um novo chat no banco
+        3 - buscar os materiais da matéria no banco(se não existirem localmente)
+        4 - criar os embeddings dos materiais da matéria(se não existirem localmente)
     """
     sid = request.sid
 
     aluno_id = data['aluno_id']
+    materia_id = data['materia_id']
     mensagem = data['mensagem']
 
-    #1. Cria um novo chat usando o ID do aluno
-    prompt_nome_chat = f"""Você é um assistente que precisa criar um nome curto, objetivo e DESCRITIVO para um chat, com base na pergunta abaixo. O nome deve:
+    # 1 - criar o nome do novo chat
+    nome_chat = GerarNomeDoChat(mensagem)
 
-- Ser em **português**
-- Ter no máximo **64 caracteres**
-- Ter apenas UMA linha
-- Ser formatado como **título com espaços** (não junte as palavras)
-- NÃO inclua pontuação ou aspas
-- Responda APENAS com o nome gerado (sem explicações)
-
-<pergunta_aluno>
-{mensagem}
-</pergunta_aluno>
-"""
-    response_nome_chat = client.generate(
-        model="mistral",
-        prompt=prompt_nome_chat,
-        stream=False,
-        options={
-            'num_predict': 16,
-            'temperature': 0.7,
-        }
-    ).get("response", "")
-    print(f"Nome criado para o chat: {response_nome_chat}")
-    chat = criar_chat(aluno_id, response_nome_chat)
+    # 2 - criar um novo chat no banco
+    chat = criar_chat(aluno_id, nome_chat)
     print(f"Chat criado:\n{chat}")
+
+    # 3 - busca os materiais da matéria no banco
+    if materia_id not in materiais:
+        arquivos = 'query no banco de dados para verificar a existência dos arquivos'
+
+        # 4 - criar os embeddings dos materiais da matéria
+        arquivos_embedded = GerarEmbeddingDeMaterial(arquivos)
+
+        materiais[materia_id] = {
+            'arquivos':arquivos,
+            'arquivos_embedded':arquivos_embedded
+        }        
+
     socketio.emit("novo_chat", chat, to=sid)
     socketio.sleep(0)
-    
-    #2. Salva a mensagem no banco de dados relacional usando o ID do aluno e o ID do chat criado
-    mensagem_aluno = criar_mensagem(chat['id'], aluno_id, mensagem)
-    mensagem_aluno_formatada = formatar_mensagem_salva(mensagem_aluno)
-    print(f"Mensagem salva:\n{mensagem_aluno_formatada}")
-    #print(f"Mensagem salva:\n{mensagem_aluno}")
 
-    #3. Salva temporariamente pra emitir em outro evento
-    pendentes[sid] = {
-        "chat": chat,
-        "mensagem": mensagem_aluno
-    }
-
-@socketio.on('pronto_para_receber')
-def handle_pronto_para_receber():
+@socketio.on('abrindo_chat')
+def handle_abrir_chat(data: dict[str,str]):
     """
-    Função responsável por lidar com os eventos subsequentes após receber o "handshake" do front-end.
-
-    1. Emite a mensagem inicial enviada pelo aluno, armazenada em `pendentes`
-    2. Gera a resposta da LLM.
-    """
-    sid = request.sid
-    dados = pendentes.get(sid)
-    
-    if not dados:
-        print(f'Nenhum dado para o socket {sid}')
-        return
-    
-    chat = dados['chat']
-    mensagem_aluno = dados['mensagem']
-
-    print(f"Cliente pronto para receber. Emitindo mensagem e iniciando resposta para chat {chat['id']}")
-    
-    #1. Emite a mensagem inicial enviada pelo aluno, armazenada em `pendentes`
-    socketio.emit("mensagem_aluno", mensagem_aluno, to=sid)
-    socketio.sleep(0)
-    
-    try:
-        #2. Gera uma resposta com a LLM
-        #2.1. Gera e emite um ID para a mensagem da LLM
-        id_mensagem_llm = uuid.uuid4()
-        socketio.emit("resposta_inicio", str(id_mensagem_llm), to=sid)
-        socketio.sleep(0)
-
-        #2.2. Faz uma busca semântica no banco vetorial usando o conteúdo da mensagem do aluno
-        contexts = collection.query(
-            query_texts=[mensagem_aluno['conteudo']],
-            n_results=5,
-        )
-        print(f"Contextos encontrados:\n{contexts}")
-        
-        #2.3. Extrai os documentos dos contextos
-        documentos = "\n\n".join([doc for doc in contexts.get('documents', [[]])[0]])
-        
-        #2.4. Gera o prompt para a LLM
-        prompt_llm = f"""
-Com base nas informações fornecidas nos trechos de documentos abaixo, responda ao comando do aluno.
-Se a resposta não estiver contida nos trechos fornecidos, responda APENAS "Não sei responder com base nas informações disponíveis".
-Formate a resposta em markdown com tags relevantes para títulos, parágrafos, listas e etc.
-
-<documentos_relevantes>
-# Documentos recuperados por busca semântica. Use para enriquecer a resposta com dados objetivos.
-{documentos}
-</documentos_relevantes>
-
-<comando_aluno>
-# Comando do aluno. Use para responder ao aluno.
-{mensagem_aluno['conteudo']}
-</comando_aluno>
-"""
-        print(f"Prompt para a LLM:\n{prompt_llm}")
-
-        resposta_completa = ""
-        print("Enviando requisição para a LLM...")
-        
-        #2.5. Gera a resposta da LLM
-        response = client.generate(
-            model="mistral",
-            prompt=prompt_llm,
-            stream=True,
-            options={
-                # 'num_predict': 512,
-                'temperature': 0.7,
-            }
-        )
-        
-        print("Recebendo resposta da LLM...")
-        
-        #2.6. Pega e emite cada um dos chunks gerados
-        for chunk in response:
-            texto = chunk.get("response", "")
-            print(f"Chunk recebido: {texto}")
-            if texto:
-                resposta_completa += texto
-                socketio.emit("resposta_chunk", texto, to=request.sid)
-                print(f"Chunk emitido: {texto}")
-                socketio.sleep(0)
-        
-        print(f"Resposta completa: {resposta_completa}")
-        
-        if not resposta_completa.strip():
-            raise ValueError("A resposta da LLM está vazia")
-    
-    except Exception as e:
-        error_msg = f"Erro ao gerar resposta: {str(e)}"
-        print(error_msg)
-        socketio.emit("erro", {"mensagem": error_msg}, to=request.sid)
-        return
-    
-    #3. Salva a resposta da LLM no banco de dados relacional usando o ID da LLM e o ID do chat criado
-    mensagem_llm = criar_mensagem(chat['id'], LLM_UUID, resposta_completa)
-    print(f"Resposta da LLM salva:\n{mensagem_llm}") 
-    
-    #4. Envia a resposta para o front-end
-    socketio.emit("resposta_fim", mensagem_llm, to=sid)
-    socketio.sleep(0)
-
-@socketio.on('nova_mensagem_aluno')
-def handle_nova_mensagem(data: dict[str, str]):
-    """
-    Função responsável por lidar com mensagens.
+    Função responsável por lidar com a abertura de um chat existente
 
     Espera receber:
-        - `chat_id`: o ID do chat que está recebendo a mensagem
-        - `aluno_id`: o ID do aluno que enviou a mensagem
-        - `mensagem`: o conteúdo da mensagem
+        - `aluno_id`: o ID do usuário que enviou a mensagem
+        - `materia_id`: o ID da matéria selecionada para o chat
 
-        1. Salva a mensagem no banco de dados relacional usando o ID do aluno e o ID do chat
-        2. Chama a LLM para gerar uma resposta
-        3. Salva a resposta da LLM no banco de dados relacional usando o ID da LLM e o ID do chat
-        4. Envia a resposta para o front-end
+        1 - buscar os materiais da matéria no banco(se não existirem localmente)
+        2 - criar os embeddings dos materiais da matéria(se não existirem localmente)
     """
     sid = request.sid
 
-    chat_id = data['chat_id']
     aluno_id = data['aluno_id']
-    mensagem = data['mensagem']
-    
-    #1. Salva a mensagem no banco de dados relacional usando o ID do aluno e o ID do chat criado
-    mensagem_aluno = criar_mensagem(chat_id, aluno_id, mensagem)
-    mensagem_aluno_formatada = formatar_mensagem_salva(mensagem_aluno)
-    print(f"Mensagem salva:\n{mensagem_aluno_formatada}")
-    socketio.emit("res_mensagem", mensagem_aluno, to=sid)
+    materia_id = data['materia_id']
+
+    # 1 - busca os materiais da matéria no banco
+    if materia_id not in materiais:
+        arquivos = 'query no banco de dados para verificar a existência dos arquivos'
+
+        # 2 - criar os embeddings dos materiais da matéria
+        arquivos_embedded = GerarEmbeddingDeMaterial(arquivos)
+
+        materiais[materia_id] = {
+            'arquivos':arquivos,
+            'arquivos_embedded':arquivos_embedded
+        }        
+
+    chat = 'query que busca o chat no banco'
+
+    socketio.emit("novo_chat", chat, to=sid)
     socketio.sleep(0)
+
+@socketio.on('nova_mensagem')
+def handle_nova_mensagem(data: dict[str, str]):
+    """
+    Função responsável por lidar com a criação de um novo chat
+
+    Espera receber:
+        - `aluno_id`: o ID do usuário que enviou a mensagem
+        - `materia_id`: o ID da matéria selecionada para o chat
+        - `chat_id`: o ID do chat onde a mensagem foi enviada
+        - `mensagem`: o conteúdo da mensagem 
+
+        1 - busca as informações do aluno e salva localmente
+        2 - salva a mensagem no banco de dados
+        3 - adiciona a mensagem ao resumo local
+        4 - cria o embedding da mensagem
+        5 - verifica se a mensagem tem alguma similaridade com os embeddings da matéria
+        6 - cria e envia o promt
+        7 - salva a resposta da llm no banco de dados
+        8 - envia a resposta
+    """
     
-    try:
-        #2. Gera uma resposta com a LLM
-        #2.1. Gera e emite um ID para a mensagem da LLM
-        id_mensagem_llm = uuid.uuid4()
-        socketio.emit("resposta_inicio", str(id_mensagem_llm), to=sid)
-        socketio.sleep(0)
+    sid = request.sid
+    
+    aluno_id = data['aluno_id']
+    chat_id = data['chat_id']
+    materia_id = data['materia_id']
+    mensagem_sent = data['mensagem']
 
-        #2.2. Busca as N mensagens mais recentes do chat até atingir o limite de tokens
-        n_mensagens = 20
-        total_tokens = 0
-        limite_tokens = 4096
-        mensagens_para_tokenizer = []
-        ha_mais_mensagens = True # Evita loops infinitos
+    # 1 - busca as informações do aluno e salva localmente
+    nome = 'buscar o nome do aluno no banco pelo id'
+    materia = 'buscar o nome da materia no banco pelo id'
 
-        
+    # 2 - salva a mensagem no banco de dados
+    mensagem = criar_mensagem(chat_id, aluno_id, mensagem_sent)
 
-
-        while total_tokens < limite_tokens and ha_mais_mensagens:
-            mensagens_recentes = buscar_ultimas_n_mensagens(chat_id, n_mensagens)
-            mensagens_recentes_formatadas = formatar_mensagens_recentes(mensagens_recentes)
-            print(f"Mensagens recentes encontradas:\n{mensagens_recentes_formatadas}")
-            #print(f"Mensagens recentes encontradas:\n{mensagens_recentes}")
-
-            # Se a quantidade de mensagens retornadas for menor que a quantidade solicitada, significa que não há mais mensagens
-            if len(mensagens_recentes) < n_mensagens:
-                ha_mais_mensagens = False
-
-            mensagens_para_tokenizer.extend([
-                {"role": "user", "content": m["conteudo"]} if m["sender_id"] == aluno_id else
-                {"role": "assistant", "content": m["conteudo"]}
-                for m in mensagens_recentes
-            ])
-
-            #for m in mensagens_recentes:
-            #    if m["sender_id"] == aluno_id:
-            #        mensagens_para_tokenizer.append({"role": "user", "content": m["conteudo"]})
-            #    else:
-            #        mensagens_para_tokenizer.append({"role": "assistant", "content": m["conteudo"]})
-
-            mensagens_para_tokenizer_formatada = formatar_mensagens_tokenizacao(mensagens_para_tokenizer)
-            print(f"Mensagens para tokenização:\n{mensagens_para_tokenizer_formatada}")
-            #print(f"Mensagens para tokenização:\n{mensagens_para_tokenizer}")
-
-
-            total_tokens += contar_tokens_mensagens(mensagens_para_tokenizer)
-            print(f"Total de tokens: {total_tokens}")
-        
-        #Formatação de conversa mais amigável para os prompts
-        #conversa_formatada = preparar_conversa_anterior(mensagens_para_tokenizer)
-
-        
-        
-        prompt_rag = f"""
-Você é um assistente que decide se uma pergunta pode ser respondida apenas com base na conversa anterior com o usuário, ou se precisa consultar documentos externos para dar uma resposta precisa (como materiais didáticos, textos técnicos ou artigos em uma base de conhecimento).
-
-<mensagem_usuario>
-{mensagem_aluno['conteudo']}
-</mensagem_usuario>
-
-<conversa_anterior>
-{mensagens_para_tokenizer_formatada}
-</conversa_anterior>
-
-Se a resposta à pergunta do usuário pode ser dada com base apenas na conversa anterior, responda com "N".
-
-Se for necessário consultar documentos externos para responder corretamente, responda com "S".
-
-Responda APENAS com a letra S ou N.
-"""
-        print(f"Prompt para decisão de RAG:\n{prompt_rag}")
-
-        resposta_rag = client.generate(
-            model="mistral",
-            prompt=prompt_rag,
-            stream=False,
-            options={
-                'num_predict': 1,
-                'temperature': 0.0,
-            }
-        ).get("response", "")
-        print(f"Resposta da decisão de RAG: '{resposta_rag}'")
-
-        documentos = ""
-        if resposta_rag.strip() == "S":
-            #2.3. Faz uma busca semântica no banco vetorial usando o conteúdo da mensagem do aluno
-            contexts = collection.query(
-                query_texts=[mensagem_aluno['conteudo']],
-                n_results= 5
-            )
-            #print(f"Contextos encontrados:\n{contexts}")    
-
-            #2.4. Extrai os documentos dos contextos
-            documentos = "\n\n".join([doc for doc in contexts.get('documents', [[]])[0]])
-        
-        if documentos and documentos.strip():
-            documentos_section = f"<documentos_relevantes>\n{documentos}\n</documentos_relevantes>"
+    # 3 - adiciona a mensagem ao resumo local
+    if chat_id not in resumo_local:
+        resumo_local[chat_id]['resumo'] = mensagem_sent
+        resumo_local[chat_id]['iteracao'] = 1
+    else:
+        if resumo_local[chat_id]['iteracao'] >= 7: 
+            resumo_local[chat_id]['resumo'] = CriarResumoDasMensagensDoChat(resumo_local[chat_id],mensagem)
+            resumo_local[chat_id]['iteracao'] = 0
         else:
-            documentos_section = ""
-        
-        #2.5. Gera o prompt para a LLM
-        prompt_llm = f"""
-<mensagens_recentes>
-# Histórico recente da conversa. Use para manter o tom e o contexto do usuário.
-{mensagens_para_tokenizer_formatada}
-</mensagens_recentes>
+            resumo_local[chat_id]['resumo'] = f"{resumo_local[chat_id]['resumo']}\n{mensagem}"
+            resumo_local[chat_id]['iteracao'] = resumo_local[chat_id]['iteracao'] + 1 
 
-{documentos_section}
 
-<comando_aluno>
-# Comando do aluno. Use para responder ao aluno.
-{mensagem_aluno['conteudo']}
-</comando_aluno>
-"""
-        print(f"Prompt para a LLM:\n{prompt_llm}")
 
-        resposta_completa = ""
-        print("Enviando requisição para a LLM...")
-        
-        #2.6. Gera a resposta da LLM
-        response = client.generate(
-            model="mistral",
-            prompt=prompt_llm,
-            stream=True,
-            options={
-                #'num_predict': 512,
-                'temperature': 0.7,
-            }
-        )
-        
-        print("Recebendo resposta da LLM...")
-        
-        #2.7. Pega e emite cada um dos chunks gerados
-        for chunk in response:
-            texto = chunk.get("response", "")
-            print(f"Chunk recebido: {texto}")
-            if texto:
-                resposta_completa += texto
-                socketio.emit("resposta_chunk", texto, to=sid)
-                socketio.sleep(0)
-        
-        print(f"Resposta completa: {resposta_completa}")
-        
-        if not resposta_completa.strip():
-            raise ValueError("A resposta da LLM está vazia")
-    
-    except Exception as e:
-        error_msg = f"Erro ao gerar resposta: {str(e)}"
-        print(error_msg)
-        socketio.emit("erro", {"mensagem": error_msg}, to=sid)
-        return
+    # 4 - cria o embedding da mensagem
+    mensagem_emb = GerarEmbeddingDeMensagem(mensagem)
 
-    #3. Salva a resposta da LLM no banco de dados relacional usando o ID da LLM e o ID do chat criado
-    mensagem_llm = criar_mensagem(chat_id, LLM_UUID, resposta_completa)
-    mensagem_llm_formatada = formatar_mensagem_salva(mensagem_llm)
-    print(f"Resposta da LLM salva:\n{mensagem_llm_formatada}") 
-    #print(f"Resposta da LLM salva:\n{mensagem_llm}")
-    
-    #4. Envia a resposta para o front-end
-    socketio.emit("resposta_fim", mensagem_llm, to=sid)
+    # 5 - verifica se a mensagem tem alguma similaridade com os embeddings da matéria
+    documentos = RealizarBuscaNoMaterialSemanticoDaMateria(materiais[materia_id]['arquivos_embedded'],mensagem_emb)
+
+    # 6 - cria e envia o promt
+    prompt = CriarPrompt(nome,materia,documentos,resumo_local[chat_id],mensagem_sent)
+
+    resposta = client.generate(
+        model="mistral",
+        prompt=prompt,
+        stream=False,
+        options={
+            'num_predict': 512,
+            'temperature': 0.7,
+        }
+    )
+
+    # 7 - salva a resposta da llm no banco de dados
+    mensagem_llm = criar_mensagem(chat['id'], LLM_UUID, resposta)
+
+    # 8 - envia a resposta
+    socketio.emit("resposta", mensagem_llm, to=sid)
     socketio.sleep(0)

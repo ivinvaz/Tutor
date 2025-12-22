@@ -1,0 +1,2 @@
+def CriarResumoDasMensagensDoChat(mensagens,mensagem):
+    
